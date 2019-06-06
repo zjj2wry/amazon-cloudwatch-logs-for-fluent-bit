@@ -11,20 +11,22 @@
 // express or implied. See the License for the specific language governing
 // permissions and limitations under the License.
 
-// Package plugins contains functions that are useful across fluent bit plugins.
-// This package will be imported by the CloudWatch Logs and Kinesis Data Streams plugins.
-
 package cloudwatch
 
 import (
 	"fmt"
+	"os"
 	"time"
 	"unicode/utf8"
 
-	"github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/awslabs/amazon-cloudwatch-logs-for-fluent-bit/plugins"
+	fluentbit "github.com/fluent/fluent-bit-go/output"
 	jsoniter "github.com/json-iterator/go"
+	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -34,7 +36,13 @@ const (
 	maximumLogEventsPerPut = 10000
 )
 
-type LogStream struct {
+type cloudWatchLogsClient interface {
+	CreateLogGroup(input *cloudwatchlogs.CreateLogGroupInput) (*cloudwatchlogs.CreateLogGroupOutput, error)
+	CreateLogStream(input *cloudwatchlogs.CreateLogStreamInput) (*cloudwatchlogs.CreateLogStreamOutput, error)
+	PutLogEvents(input *cloudwatchlogs.PutLogEventsInput) (*cloudwatchlogs.PutLogEventsOutput, error)
+}
+
+type logStream struct {
 	logEvents         []*cloudwatchlogs.InputLogEvent
 	currentByteLength int
 	nextSequenceToken *string
@@ -45,33 +53,88 @@ type OutputPlugin struct {
 	region          string
 	logGroupName    string
 	logStreamPrefix string
-	client          *cloudwatchlogs.CloudWatchLogs
-	streams         map[string]*LogStream
+	client          cloudWatchLogsClient
+	streams         map[string]*logStream
+	backoff         *plugins.Backoff
+	timer           *plugins.Timeout
 }
 
-func (output *OutputPlugin) AddEvent(tag string, record map[interface{}]interface{}, timestamp time.Time) error {
+// NewOutputPlugin creates a OutputPlugin object
+func NewOutputPlugin(region string, logGroupName string, logStreamPrefix string, roleARN string, autoCreateGroup bool) (*OutputPlugin, error) {
+	sess, err := session.NewSession(&aws.Config{
+		Region: aws.String(region),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	client := newCloudWatchLogsClient(roleARN, sess)
+
+	timer, err := plugins.NewTimeout(func(d time.Duration) {
+		logrus.Errorf("[cloudwatch] timeout threshold reached: Failed to send logs for %v\n", d)
+		logrus.Error("[cloudwatch] Quitting Fluent Bit")
+		os.Exit(1)
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if autoCreateGroup {
+		err = createLogGroup(logGroupName, client)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &OutputPlugin{
+		region:          region,
+		logGroupName:    logGroupName,
+		logStreamPrefix: logStreamPrefix,
+		client:          client,
+		backoff:         plugins.NewBackoff(),
+		timer:           timer,
+		streams:         make(map[string]*logStream),
+	}, nil
+}
+
+func newCloudWatchLogsClient(roleARN string, sess *session.Session) *cloudwatchlogs.CloudWatchLogs {
+	if roleARN != "" {
+		creds := stscreds.NewCredentials(sess, roleARN)
+		return cloudwatchlogs.New(sess, &aws.Config{Credentials: creds})
+	}
+
+	return cloudwatchlogs.New(sess)
+}
+
+func (output *OutputPlugin) AddEvent(tag string, record map[interface{}]interface{}, timestamp time.Time) (int, error) {
 	data, retCode, err := output.processRecord(record)
 	if err != nil {
 		return retCode, err
 	}
-
 	event := string(data)
-	if len(output.logEvents) == maximumLogEventsPerPut || (output.currentByteLength+cloudwatchLen(event)) >= maximumBytesPerPut {
-		err = output.putLogEvents()
+
+	stream, err := output.getLogStream(tag)
+	if err != nil {
+		return fluentbit.FLB_ERROR, err
+	}
+
+	if len(stream.logEvents) == maximumLogEventsPerPut || (stream.currentByteLength+cloudwatchLen(event)) >= maximumBytesPerPut {
+		err = output.putLogEvents(stream)
 		if err != nil {
-			return err
+			return fluentbit.FLB_ERROR, err
 		}
 	}
 
-	output.logEvents = append(output.logEvents, &cloudwatchlogs.InputLogEvent{
+	stream.logEvents = append(stream.logEvents, &cloudwatchlogs.InputLogEvent{
 		Message:   aws.String(event),
 		Timestamp: aws.Int64(timestamp.Unix()),
 	})
-	output.currentByteLength += cloudwatchLen(event)
-	return nil
+	stream.currentByteLength += cloudwatchLen(event)
+	return fluentbit.FLB_ERROR, nil
 }
 
-func (output *OutputPlugin) getLogStream(tag string) (*LogStream, error) {
+func (output *OutputPlugin) getLogStream(tag string) (*logStream, error) {
 	// find log stream by tag
 	stream, ok := output.streams[tag]
 	if !ok {
@@ -82,17 +145,25 @@ func (output *OutputPlugin) getLogStream(tag string) (*LogStream, error) {
 	return stream, nil
 }
 
-func (output *OutputPlugin) createStream(name string) (*LogStream, err) {
+func (output *OutputPlugin) createStream(name string) (*logStream, error) {
 	_, err := output.client.CreateLogStream(&cloudwatchlogs.CreateLogStreamInput{
 		LogGroupName:  aws.String(output.logGroupName),
 		LogStreamName: aws.String(name),
 	})
 
-	return &LogStream{
+	return &logStream{
 		logStreamName:     name,
 		logEvents:         make([]*cloudwatchlogs.InputLogEvent, 0, maximumLogEventsPerPut),
 		nextSequenceToken: nil, // sequence token not required for a new log stream
 	}, err
+}
+
+func createLogGroup(name string, client cloudWatchLogsClient) error {
+	_, err := client.CreateLogGroup(&cloudwatchlogs.CreateLogGroupInput{
+		LogGroupName: aws.String(name),
+	})
+
+	return err
 }
 
 func (output *OutputPlugin) processRecord(record map[interface{}]interface{}) ([]byte, int, error) {
@@ -113,27 +184,31 @@ func (output *OutputPlugin) processRecord(record map[interface{}]interface{}) ([
 	return data, fluentbit.FLB_OK, nil
 }
 
-func (output *CloudWatchOutput) Flush() error {
-	return output.putLogEvents()
+func (output *OutputPlugin) Flush(tag string) error {
+	stream, err := output.getLogStream(tag)
+	if err != nil {
+		return err
+	}
+	return output.putLogEvents(stream)
 }
 
-func (output *CloudWatchOutput) putLogEvents() error {
+func (output *OutputPlugin) putLogEvents(stream *logStream) error {
 	fmt.Println("Sending to CloudWatch")
 	response, err := output.client.PutLogEvents(&cloudwatchlogs.PutLogEventsInput{
-		LogEvents:     output.logEvents,
-		LogGroupName:  aws.String(output.logGroup),
-		LogStreamName: aws.String(output.logStream),
-		SequenceToken: output.nextSequenceToken,
+		LogEvents:     stream.logEvents,
+		LogGroupName:  aws.String(output.logGroupName),
+		LogStreamName: aws.String(stream.logStreamName),
+		SequenceToken: stream.nextSequenceToken,
 	})
 	if err != nil {
 		fmt.Println(err)
 		return err
 	}
-	fmt.Printf("Sent %d events to CloudWatch\n", len(output.logEvents))
+	fmt.Printf("Sent %d events to CloudWatch\n", len(stream.logEvents))
 
-	output.nextSequenceToken = response.NextSequenceToken
-	output.logEvents = output.logEvents[:0]
-	output.currentByteLength = 0
+	stream.nextSequenceToken = response.NextSequenceToken
+	stream.logEvents = stream.logEvents[:0]
+	stream.currentByteLength = 0
 
 	return nil
 }
