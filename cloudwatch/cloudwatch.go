@@ -36,7 +36,7 @@ const (
 	maximumLogEventsPerPut = 10000
 )
 
-type cloudWatchLogsClient interface {
+type CloudWatchLogsClient interface {
 	CreateLogGroup(input *cloudwatchlogs.CreateLogGroupInput) (*cloudwatchlogs.CreateLogGroupOutput, error)
 	CreateLogStream(input *cloudwatchlogs.CreateLogStreamInput) (*cloudwatchlogs.CreateLogStreamOutput, error)
 	PutLogEvents(input *cloudwatchlogs.PutLogEventsInput) (*cloudwatchlogs.PutLogEventsOutput, error)
@@ -53,7 +53,7 @@ type OutputPlugin struct {
 	region          string
 	logGroupName    string
 	logStreamPrefix string
-	client          cloudWatchLogsClient
+	client          CloudWatchLogsClient
 	streams         map[string]*logStream
 	backoff         *plugins.Backoff
 	timer           *plugins.Timeout
@@ -139,26 +139,34 @@ func (output *OutputPlugin) getLogStream(tag string) (*logStream, error) {
 	stream, ok := output.streams[tag]
 	if !ok {
 		// stream doesn't exist, create it
-		return output.createStream(output.logStreamPrefix + tag)
+		return output.createStream(output.logStreamPrefix+tag, tag)
 	}
 
 	return stream, nil
 }
 
-func (output *OutputPlugin) createStream(name string) (*logStream, error) {
+func (output *OutputPlugin) createStream(name, tag string) (*logStream, error) {
 	_, err := output.client.CreateLogStream(&cloudwatchlogs.CreateLogStreamInput{
 		LogGroupName:  aws.String(output.logGroupName),
 		LogStreamName: aws.String(name),
 	})
 
-	return &logStream{
+	if err != nil {
+		return nil, err
+	}
+
+	stream := &logStream{
 		logStreamName:     name,
 		logEvents:         make([]*cloudwatchlogs.InputLogEvent, 0, maximumLogEventsPerPut),
 		nextSequenceToken: nil, // sequence token not required for a new log stream
-	}, err
+	}
+
+	output.streams[tag] = stream
+
+	return stream, nil
 }
 
-func createLogGroup(name string, client cloudWatchLogsClient) error {
+func createLogGroup(name string, client CloudWatchLogsClient) error {
 	_, err := client.CreateLogGroup(&cloudwatchlogs.CreateLogGroupInput{
 		LogGroupName: aws.String(name),
 	})

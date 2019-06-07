@@ -19,68 +19,92 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/service/firehose"
-	"github.com/awslabs/amazon-kinesis-firehose-for-fluent-bit/firehose/mock_firehose"
-	"github.com/awslabs/amazon-kinesis-firehose-for-fluent-bit/plugins"
+	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/awslabs/amazon-cloudwatch-logs-for-fluent-bit/cloudwatch/mock_cloudwatch"
+	"github.com/awslabs/amazon-cloudwatch-logs-for-fluent-bit/plugins"
 	"github.com/golang/mock/gomock"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 )
 
-func TestAddRecord(t *testing.T) {
+const (
+	testRegion          = "us-west-2"
+	testLogGroup        = "my-logs"
+	testLogStreamPrefix = "my-prefix"
+	testTag             = "tag"
+)
+
+func TestAddEvent(t *testing.T) {
 	timer, _ := plugins.NewTimeout(func(d time.Duration) {
 		logrus.Errorf("[firehose] timeout threshold reached: Failed to send logs for %v\n", d)
 		logrus.Error("[firehose] Quitting Fluent Bit")
 		os.Exit(1)
 	})
-	output := OutputPlugin{
-		region:         "us-east-1",
-		deliveryStream: "stream",
-		dataKeys:       "",
-		client:         nil,
-		records:        make([]*firehose.Record, 0, 500),
-		backoff:        plugins.NewBackoff(),
-		timer:          timer,
-	}
-
-	record := map[interface{}]interface{}{
-		"somekey": []byte("some value"),
-	}
-
-	output.AddRecord(record)
-
-	assert.Len(t, output.records, 1, "Expected output to contain 1 record")
-}
-
-func TestAddRecordAndFlush(t *testing.T) {
-	record := map[interface{}]interface{}{
-		"somekey": []byte("some value"),
-	}
 
 	ctrl := gomock.NewController(t)
-	mockFirehose := mock_firehose.NewMockPutRecordBatcher(ctrl)
+	mockCloudWatch := mock_cloudwatch.NewMockCloudWatchLogsClient(ctrl)
 
-	mockFirehose.EXPECT().PutRecordBatch(gomock.Any()).Return(&firehose.PutRecordBatchOutput{
-		FailedPutCount: aws.Int64(0),
-	}, nil)
+	mockCloudWatch.EXPECT().CreateLogStream(gomock.Any()).Do(func(input *cloudwatchlogs.CreateLogStreamInput) {
+		assert.Equal(t, aws.StringValue(input.LogGroupName), testLogGroup, "Expected log group name to match")
+		assert.Equal(t, aws.StringValue(input.LogStreamName), testLogStreamPrefix+testTag, "Expected log group name to match")
+	}).Return(&cloudwatchlogs.CreateLogStreamOutput{}, nil)
 
+	output := OutputPlugin{
+		region:          testRegion,
+		logGroupName:    testLogGroup,
+		logStreamPrefix: testLogStreamPrefix,
+		client:          mockCloudWatch,
+		backoff:         plugins.NewBackoff(),
+		timer:           timer,
+		streams:         make(map[string]*logStream),
+	}
+
+	record := map[interface{}]interface{}{
+		"somekey": []byte("some value"),
+	}
+
+	output.AddEvent(testTag, record, time.Now())
+
+}
+
+func TestAddEventAndFlush(t *testing.T) {
 	timer, _ := plugins.NewTimeout(func(d time.Duration) {
 		logrus.Errorf("[firehose] timeout threshold reached: Failed to send logs for %v\n", d)
 		logrus.Error("[firehose] Quitting Fluent Bit")
 		os.Exit(1)
 	})
 
+	ctrl := gomock.NewController(t)
+	mockCloudWatch := mock_cloudwatch.NewMockCloudWatchLogsClient(ctrl)
+
+	gomock.InOrder(
+		mockCloudWatch.EXPECT().CreateLogStream(gomock.Any()).Do(func(input *cloudwatchlogs.CreateLogStreamInput) {
+			assert.Equal(t, aws.StringValue(input.LogGroupName), testLogGroup, "Expected log group name to match")
+			assert.Equal(t, aws.StringValue(input.LogStreamName), testLogStreamPrefix+testTag, "Expected log stream name to match")
+		}).Return(&cloudwatchlogs.CreateLogStreamOutput{}, nil),
+		mockCloudWatch.EXPECT().PutLogEvents(gomock.Any()).Do(func(input *cloudwatchlogs.PutLogEventsInput) {
+			assert.Equal(t, aws.StringValue(input.LogGroupName), testLogGroup, "Expected log group name to match")
+			assert.Equal(t, aws.StringValue(input.LogStreamName), testLogStreamPrefix+testTag, "Expected log stream name to match")
+		}).Return(&cloudwatchlogs.PutLogEventsOutput{
+			NextSequenceToken: aws.String("token"),
+		}, nil),
+	)
+
 	output := OutputPlugin{
-		region:         "us-east-1",
-		deliveryStream: "stream",
-		dataKeys:       "",
-		client:         mockFirehose,
-		records:        make([]*firehose.Record, 0, 500),
-		backoff:        plugins.NewBackoff(),
-		timer:          timer,
+		region:          testRegion,
+		logGroupName:    testLogGroup,
+		logStreamPrefix: testLogStreamPrefix,
+		client:          mockCloudWatch,
+		backoff:         plugins.NewBackoff(),
+		timer:           timer,
+		streams:         make(map[string]*logStream),
 	}
 
-	output.AddRecord(record)
-	output.Flush()
+	record := map[interface{}]interface{}{
+		"somekey": []byte("some value"),
+	}
+
+	output.AddEvent(testTag, record, time.Now())
+	output.Flush(testTag)
 
 }
